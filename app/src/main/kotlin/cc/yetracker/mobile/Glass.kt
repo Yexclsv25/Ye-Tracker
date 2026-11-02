@@ -62,7 +62,8 @@ class Glass(val v: View, private val radiusDp: Float) {
         c.clipPath(path)
         val src = source
         if (enabled && src != null && src.width > 0) {
-            val scale = 0.1f
+            val lite = Store.glassLite
+            val scale = if (lite) 0.07f else 0.1f
             val bw = maxOf(2, (w * scale).toInt())
             val bh = maxOf(2, (h * scale).toInt())
             var b = bmp
@@ -79,7 +80,7 @@ class Glass(val v: View, private val radiusDp: Float) {
             cv.scale(scale, scale)
             cv.translate((s[0] - a[0]).toFloat(), (s[1] - a[1]).toFloat())
             try { src.draw(cv) } catch (_: Exception) {}
-            blur(b, 2)
+            blur(b, if (lite) 1 else 2)
             c.drawBitmap(b, null, rect, bmpPaint)
             fill.color = Color.argb(95, 12, 12, 14)
             c.drawRect(rect, fill)

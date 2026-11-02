@@ -307,6 +307,7 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
         Store.init(this)
         Pal.setAccent(Store.accentIdx)
+        main.postDelayed({ showWhatsNew() }, 1200)
 
         root = FrameLayout(this)
         root.setBackgroundColor(Pal.BG)
@@ -635,6 +636,8 @@ class MainActivity : AppCompatActivity() {
             "Accent color: " + Pal.ACCENT_NAMES[Store.accentIdx.coerceIn(0, Pal.ACCENT_NAMES.size - 1)],
             "Sleep timer: " + sleepLabel(),
             "Check for updates (v" + Updater.currentName(this) + ")",
+            "About Ye Tracker",
+            "Lighter Liquid Glass: " + (if (Store.glassLite) "On" else "Off (full quality)"),
             "Reset Wrapped stats"
         )
         MaterialAlertDialogBuilder(this).setTitle("Settings").setItems(labels) { _, i ->
@@ -647,6 +650,8 @@ class MainActivity : AppCompatActivity() {
                 5 -> accentDialog()
                 6 -> sleepDialog()
                 7 -> checkUpdate(true)
+                8 -> aboutDialog()
+                9 -> { Store.glassLite = !Store.glassLite; invalidateGlass(true); settings() }
                 else -> MaterialAlertDialogBuilder(this).setTitle("Reset Wrapped?")
                     .setMessage("This clears your listening minutes, play counts and top songs.")
                     .setPositiveButton("Reset") { _, _ -> Store.resetStats(); toast("Wrapped reset"); settings() }
@@ -708,6 +713,28 @@ class MainActivity : AppCompatActivity() {
             Discord.tick()
             main.postDelayed(this, 150)
         }
+    }
+
+    /* ----- about / what's new ----- */
+
+    private fun aboutDialog() {
+        MaterialAlertDialogBuilder(this).setTitle("Ye Tracker v" + Updater.currentName(this))
+            .setMessage("An unofficial, fan-made app for yetracker.cc.\n\nOpen source on GitHub.")
+            .setPositiveButton("Open GitHub") { _, _ ->
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/" + Updater.REPO)))
+            }
+            .setNegativeButton("Close", null).show()
+    }
+
+    /** After an update installs, show what changed once. */
+    private fun showWhatsNew() {
+        val cur = Updater.currentName(this)
+        val last = Store.lastVersion
+        Store.lastVersion = cur
+        if (last.isEmpty() || last == cur) return
+        MaterialAlertDialogBuilder(this).setTitle("Updated to v$cur")
+            .setMessage("• About screen in Settings\n• New option: Lighter Liquid Glass (off = full quality, on = easier on the battery)\n• This what's-new note after updating")
+            .setPositiveButton("Nice", null).show()
     }
 
     /* ----- updater ----- */

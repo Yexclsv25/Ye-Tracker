@@ -481,6 +481,15 @@ object Store {
         get() = sp.getLong("lastUpdateCheck", 0L)
         set(v) { sp.edit().putLong("lastUpdateCheck", v).apply() }
 
+    var lastVersion: String
+        get() = sp.getString("lastVersion", "") ?: ""
+        set(v) { sp.edit().putString("lastVersion", v).apply() }
+
+    /** Lighter (cheaper) Liquid Glass rendering. Off = full quality. */
+    var glassLite: Boolean
+        get() = sp.getBoolean("glassLite", false)
+        set(v) { sp.edit().putBoolean("glassLite", v).apply() }
+
     var glass: Boolean
         get() = sp.getBoolean("glass", true)
         set(v) { sp.edit().putBoolean("glass", v).apply() }
