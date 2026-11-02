@@ -713,17 +713,13 @@ class MainActivity : AppCompatActivity() {
     /* ----- updater ----- */
 
     fun checkUpdate(manual: Boolean) {
-        if (Updater.MANIFEST_URL.isEmpty()) {
-            if (manual) toast("Updates aren't set up in this build")
-            return
-        }
         if (manual) toast("Checking for updates…")
         bg {
             try {
                 val info = Updater.fetch()
-                val cur = Updater.currentCode(this)
+                val cur = Updater.currentName(this)
                 ui {
-                    if (info.code > cur) updateDialog(info)
+                    if (Updater.isNewer(info.name, cur)) updateDialog(info)
                     else if (manual) toast("You're on the latest version")
                 }
             } catch (e: Exception) {
@@ -734,7 +730,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateDialog(info: Updater.Info) {
         val msg = (if (info.notes.isNotEmpty()) info.notes + "\n\n" else "") + "Download and install it now?"
-        MaterialAlertDialogBuilder(this).setTitle("Update available" + if (info.name.isNotEmpty()) " · v" + info.name else "")
+        MaterialAlertDialogBuilder(this).setTitle("Update available · v" + info.name)
             .setMessage(msg)
             .setPositiveButton("Update") { _, _ -> downloadUpdate(info) }
             .setNegativeButton("Later", null).show()

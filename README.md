@@ -53,20 +53,22 @@ Discord account in **Settings → Discord status**.
 
 ## Releases and the auto-updater
 
-The app checks `update.json` (at most every 12 hours, and from **Settings → Check for updates**). If it lists
-a higher `versionCode` than the installed app, it offers to download and install the APK.
+The app reads the newest [GitHub Release](https://github.com/Yexclsv25/Ye-Tracker/releases) of this repo
+(at most every 12 hours at startup, and from **Settings → Check for updates**). If the release tag is higher
+than the installed `versionName`, it shows the release notes and offers to download and install the attached
+`.apk`. Nothing needs to be configured in the code.
 
-1. Set `Updater.MANIFEST_URL` in `app/src/main/kotlin/cc/yetracker/mobile/Updater.kt` to the raw address of
-   `update.json` in this repo, e.g.
-   `https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/update.json`.
-2. For every release:
-   - raise `versionCode` (and `versionName`) in `app/build.gradle`
-   - build and sign the APK with the **same keystore every time** (Android refuses updates signed with a
-     different key)
-   - create a GitHub Release (tag `vX.Y`) and attach the APK
-   - update `update.json` (`versionCode`, `versionName`, `apkUrl`, `notes`, and optionally `sha256`, from
-     `sha256sum ye-tracker-X.Y.apk`) and commit it
-3. Users allow **Install unknown apps** for Ye Tracker once.
+To publish an update:
+
+1. In `app/build.gradle` raise `versionCode` and set `versionName` (e.g. `'1.1'`).
+2. Build and sign the APK with the **same keystore every time** (Android refuses updates signed with a
+   different key).
+3. On GitHub: **Releases → Draft a new release**, create the tag `v1.1` (it must match `versionName`),
+   write the notes (they appear in the update dialog) and attach the `.apk`. Publish it (not as a draft or
+   pre-release).
+
+Users allow **Install unknown apps** for Ye Tracker once. If GitHub provides a checksum for the attached
+file, the app verifies it before installing.
 
 ## Project layout
 
@@ -79,7 +81,7 @@ app/src/main/kotlin/cc/yetracker/mobile/
   Downloader.kt     song downloads
   Glass.kt          liquid-glass drawing
   Discord.kt        Discord status bridge (JNI)
-  Updater.kt        update.json check + APK download
+  Updater.kt        GitHub Releases check + APK download
   Ui.kt             playback service, theme colors, view helpers
 app/src/main/cpp/   Discord JNI bridge (built only when the Discord AAR is present)
 ```
