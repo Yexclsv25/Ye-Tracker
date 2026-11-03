@@ -126,6 +126,11 @@ fun View.loadCover(era: String, radiusDp: Float, onResult: (Boolean) -> Unit = {
     val c = Cover.cached(era)
     if (c != null) { apply(c); return }
     if (Cover.knownNone(era)) return
+    if (Store.covers == 2) return
+    if (Store.covers == 1) {
+        val cm = context.getSystemService(android.net.ConnectivityManager::class.java)
+        if (cm != null && cm.isActiveNetworkMetered) return
+    }
     Cover.fetch(era) { bmp ->
         post {
             if (bmp != null && getTag(R.id.cover_tag) == era) apply(bmp)

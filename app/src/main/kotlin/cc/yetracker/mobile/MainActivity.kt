@@ -19,6 +19,9 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.SystemClock
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
+import android.content.ClipboardManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.ProgressBar
 import android.content.res.ColorStateList
@@ -51,6 +54,18 @@ import java.util.concurrent.Executors
 
 private const val MATCH_ = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP_ = ViewGroup.LayoutParams.WRAP_CONTENT
+
+private val EQ_NAMES = listOf("Flat", "Bass boost", "Bass boost+", "Treble boost", "Vocal", "Loudness")
+private val GLASS_NAMES = listOf("Off (flat)", "Static (lightest)", "Live · light", "Live · full")
+private val REFRESH_NAMES = listOf("Smooth", "Balanced", "When scrolling stops")
+private val COVER_NAMES = listOf("Always", "Wi-Fi only", "Off")
+
+private fun formatBytes(b: Long): String = when {
+    b >= 1_073_741_824L -> String.format("%.1f GB", b / 1073741824.0)
+    b >= 1_048_576L -> (b / 1_048_576L).toString() + " MB"
+    b >= 1024L -> (b / 1024L).toString() + " KB"
+    else -> b.toString() + " B"
+}
 
 /* ---------- full-screen "Now Playing" ---------- */
 
@@ -106,11 +121,11 @@ class PlayerOverlay(private val app: MainActivity) {
         tcol.addView(title)
         tcol.addView(artist)
         titleRow.addView(tcol, LinearLayout.LayoutParams(0, WRAP_, 1f))
-        heart.background = app.rounded(Pal.SOFT, 22f)
+        heart.background = app.glass(22f)
         heart.pressable { app.current?.let { Store.toggleFav(it); app.updatePlayUi() } }
         titleRow.addView(heart, LinearLayout.LayoutParams(app.dp(44), app.dp(44)))
         val more = app.icon(R.drawable.ic_more, Pal.TEXT, 10)
-        more.background = app.rounded(Pal.SOFT, 22f)
+        more.background = app.glass(22f)
         more.pressable { app.current?.let { app.songMenu(it) } }
         titleRow.addView(more, LinearLayout.LayoutParams(app.dp(44), app.dp(44)).apply { marginStart = app.dp(10) })
         col.addView(titleRow, LinearLayout.LayoutParams(MATCH_, WRAP_))
@@ -237,6 +252,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var root: FrameLayout
     private lateinit var content: FrameLayout
     private lateinit var mini: GlassLinear
+    private lateinit var header: GlassLinear
+    private lateinit var headerTitle: TextView
+    val ambient = AmbientDrawable()
+    private val tabLabels = ArrayList<TextView>()
+    private var lastScrollAt = 0L
+    private val glassIdle = Runnable { invalidateGlass(true) }
     private val glassViews = ArrayList<Glass>()
     private val urlCache = java.util.concurrent.ConcurrentHashMap<String, String>()
     private lateinit var miniArt: View
@@ -282,6 +303,9 @@ class MainActivity : AppCompatActivity() {
     private var lastGlass = 0L
     private var songMs = 0L
     private var songCounted = false
+    private var lastTick = 0
+    private var resumePos = 0L
+    private var radioEra: String? = null
     private var endless = false
     private var extending = false
     private var loading = false
@@ -307,15 +331,23 @@ class MainActivity : AppCompatActivity() {
         WindowCompat.getInsetsController(window, window.decorView).isAppearanceLightStatusBars = false
         Store.init(this)
         Pal.setAccent(Store.accentIdx)
+        Pal.setAmoled(Store.amoled)
+        Bus.eqPreset = Store.eqPreset
+        Bus.skipSilence = Store.skipSilence
         main.postDelayed({ showWhatsNew() }, 1200)
 
         root = FrameLayout(this)
-        root.setBackgroundColor(Pal.BG)
+        ambient.glow = Store.ambient
+        root.background = ambient
         content = FrameLayout(this)
         root.addView(content, FrameLayout.LayoutParams(MATCH_, MATCH_))
 
         val bottom = buildBottom()
         root.addView(bottom, FrameLayout.LayoutParams(MATCH_, WRAP_, Gravity.BOTTOM))
+
+        header = buildHeader()
+        root.addView(header, FrameLayout.LayoutParams(MATCH_, dp(62), Gravity.TOP).apply { setMargins(dp(12), 0, dp(12), 0) })
+        glassViews.forEach { it.source = content; it.backdrop = root }
 
         player = PlayerOverlay(this)
         player.view.visibility = View.GONE
@@ -332,6 +364,8 @@ class MainActivity : AppCompatActivity() {
             val b = ins.getInsets(WindowInsetsCompat.Type.systemBars())
             content.setPadding(0, b.top, 0, 0)
             bottom.setPadding(0, 0, 0, b.bottom)
+            (header.layoutParams as FrameLayout.LayoutParams).topMargin = b.top + dp(6)
+            header.requestLayout()
             player.setInsets(b.top, b.bottom)
             ins
         }
@@ -354,7 +388,15 @@ class MainActivity : AppCompatActivity() {
         main.post(discordTicker)
         Bus.onFav = { current?.let { Store.toggleFav(it); updatePlayUi() } }
         Bus.onShuffle = { toggleShuffle() }
-        content.viewTreeObserver.addOnScrollChangedListener { invalidateGlass() }
+        content.viewTreeObserver.addOnScrollChangedListener {
+            lastScrollAt = SystemClock.uptimeMillis()
+            if (Store.glassRefresh == 2) {
+                main.removeCallbacks(glassIdle)
+                main.postDelayed(glassIdle, 160)
+            } else {
+                invalidateGlass()
+            }
+        }
         selectTab(0)
         try {
             getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(netCb)
@@ -363,6 +405,7 @@ class MainActivity : AppCompatActivity() {
         checkOnline()
         connect()
         handleLink(intent)
+        handleShortcut(intent)
         if (System.currentTimeMillis() - Store.lastUpdateCheck > 12 * 3600 * 1000L) {
             Store.lastUpdateCheck = System.currentTimeMillis()
             checkUpdate(false)
@@ -377,6 +420,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+        current?.let { Store.setLast(it, controller?.currentPosition ?: 0L) }
         Store.flush()
     }
 
@@ -486,6 +530,7 @@ class MainActivity : AppCompatActivity() {
         setIntent(intent)
         if (intent.getBooleanExtra("open_player", false) && current != null && !playerOpen) openPlayer()
         handleLink(intent)
+        handleShortcut(intent)
     }
 
     /** Opens a yetracker.cc song link (…/?tab=unreleased&era=…&id=e23%3A3) inside the app and plays it. */
@@ -526,7 +571,7 @@ class MainActivity : AppCompatActivity() {
         val bottom = LinearLayout(this)
         bottom.orientation = LinearLayout.VERTICAL
 
-        mini = GlassLinear(this, 32f)
+        mini = GlassLinear(this, 33f)
         glassViews.add(mini.glass)
         mini.orientation = LinearLayout.HORIZONTAL
         mini.gravity = Gravity.CENTER_VERTICAL
@@ -546,38 +591,60 @@ class MainActivity : AppCompatActivity() {
         val miniNext = icon(R.drawable.ic_next, Pal.TEXT, 8)
         miniNext.pressable { next() }
         mini.addView(miniNext, LinearLayout.LayoutParams(dp(48), dp(48)))
-        mini.pressable { openPlayer() }
+        mini.isClickable = true
+        var downX = 0f
+        mini.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX
+                    v.animate().alpha(0.7f).setDuration(80).start()
+                }
+                MotionEvent.ACTION_UP -> {
+                    v.animate().alpha(1f).setDuration(120).start()
+                    val dx = e.rawX - downX
+                    if (dx < -dp(70)) next() else if (dx > dp(70)) prev() else openPlayer()
+                }
+                MotionEvent.ACTION_CANCEL -> v.animate().alpha(1f).setDuration(120).start()
+            }
+            true
+        }
         mini.visibility = View.GONE
         bottom.addView(mini, LinearLayout.LayoutParams(MATCH_, dp(66)).apply { setMargins(dp(14), 0, dp(14), dp(10)) })
 
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
-        val pill = GlassLinear(this, 32f)
+        val pill = GlassLinear(this, 34f)
         glassViews.add(pill.glass)
         pill.orientation = LinearLayout.HORIZONTAL
         pill.gravity = Gravity.CENTER_VERTICAL
         pill.setPadding(dp(6), dp(6), dp(6), dp(6))
         val icons = intArrayOf(R.drawable.ic_home, R.drawable.ic_grid, R.drawable.ic_library)
+        val names = arrayOf("Listen Now", "Eras", "Library")
         for (i in 0..2) {
-            val f = FrameLayout(this)
+            val f = LinearLayout(this)
+            f.orientation = LinearLayout.VERTICAL
+            f.gravity = Gravity.CENTER
             val ic = icon(icons[i], Pal.SUB)
-            f.addView(ic, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
+            f.addView(ic, LinearLayout.LayoutParams(dp(24), dp(24)))
+            val lb = tv(names[i], 11f, Pal.SUB, true, 1)
+            lb.gravity = Gravity.CENTER
+            f.addView(lb, LinearLayout.LayoutParams(WRAP_, WRAP_).apply { topMargin = dp(2) })
             f.pressable { selectTab(i) }
-            pill.addView(f, LinearLayout.LayoutParams(0, dp(52), 1f))
+            pill.addView(f, LinearLayout.LayoutParams(0, dp(56), 1f).apply { setMargins(dp(2), 0, dp(2), 0) })
             tabButtons.add(f)
             tabIcons.add(ic)
+            tabLabels.add(lb)
         }
-        row.addView(pill, LinearLayout.LayoutParams(0, dp(64), 1f))
-        val sf = GlassFrame(this, 32f)
+        row.addView(pill, LinearLayout.LayoutParams(0, dp(68), 1f))
+        val sf = GlassFrame(this, 34f)
         glassViews.add(sf.glass)
         val sic = icon(R.drawable.ic_search, Pal.SUB)
         sf.addView(sic, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
         sf.pressable { selectTab(3) }
-        row.addView(sf, LinearLayout.LayoutParams(dp(64), dp(64)).apply { marginStart = dp(10) })
+        row.addView(sf, LinearLayout.LayoutParams(dp(68), dp(68)).apply { marginStart = dp(10) })
         tabButtons.add(sf)
         tabIcons.add(sic)
-        glassViews.forEach { it.source = content; it.enabled = Store.glass }
         bottom.addView(row, LinearLayout.LayoutParams(MATCH_, WRAP_).apply { setMargins(dp(14), 0, dp(14), dp(8)) })
         return bottom
     }
@@ -589,13 +656,44 @@ class MainActivity : AppCompatActivity() {
         else -> SearchPage(this).view
     }
 
+    private fun buildHeader(): GlassLinear {
+        val h = GlassLinear(this, 31f)
+        glassViews.add(h.glass)
+        h.orientation = LinearLayout.HORIZONTAL
+        h.gravity = Gravity.CENTER_VERTICAL
+        h.setPadding(dp(22), 0, dp(9), 0)
+        headerTitle = tv("Listen Now", 28f, Pal.TEXT, true, 1)
+        h.addView(headerTitle, LinearLayout.LayoutParams(0, WRAP_, 1f))
+        fun circle(res: Int, onClick: () -> Unit): View {
+            val f = FrameLayout(this)
+            f.background = glass(22f)
+            f.addView(icon(res, Pal.TEXT), FrameLayout.LayoutParams(dp(22), dp(22), Gravity.CENTER))
+            f.pressable(onClick)
+            return f
+        }
+        h.addView(circle(R.drawable.ic_search) { selectTab(3) }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        h.addView(circle(R.drawable.ic_settings) { settings() }, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginStart = dp(8) })
+        return h
+    }
+
+    private fun updateHeader() {
+        header.visibility = if (content.childCount > 1) View.GONE else View.VISIBLE
+    }
+
     fun selectTab(i: Int) {
         tab = i
+        haptic()
         content.removeAllViews()
         val v = tabViews[i] ?: buildTab(i).also { tabViews[i] = it }
         content.addView(v, FrameLayout.LayoutParams(MATCH_, MATCH_))
-        v.alpha = 0f
-        v.animate().alpha(1f).setDuration(170).start()
+        if (Store.animations) {
+            v.alpha = 0f
+            v.animate().alpha(1f).setDuration(170).start()
+        } else {
+            v.alpha = 1f
+        }
+        headerTitle.text = arrayOf("Listen Now", "Eras", "Library", "Search")[i]
+        updateHeader()
         styleTabs()
         (v.tag as? Runnable)?.run()
     }
@@ -603,21 +701,28 @@ class MainActivity : AppCompatActivity() {
     private fun styleTabs() {
         for (k in tabButtons.indices) {
             val sel = k == tab
-            tabButtons[k].background = if (sel) rounded(if (Store.glass) Color.argb(70, 255, 255, 255) else Color.BLACK, 28f) else null
-            ImageViewTint.set(tabIcons[k], if (sel) Color.WHITE else Pal.SUB)
+            tabButtons[k].background = if (sel) glass(if (k == 3) 34f else 28f, Pal.ACCENT, 70) else null
+            ImageViewTint.set(tabIcons[k], if (sel) Pal.ACCENT else Pal.SUB)
+            tabLabels.getOrNull(k)?.setTextColor(if (sel) Pal.ACCENT else Pal.SUB)
         }
         invalidateGlass(true)
     }
 
     fun invalidateGlass(force: Boolean = false) {
+        if (!force && Store.glassMode < 2) return
         val now = SystemClock.uptimeMillis()
-        if (!force && now - lastGlass < 45) return
+        if (!force) {
+            val gap = when (Store.glassRefresh) { 1 -> 110L; 2 -> Long.MAX_VALUE; else -> 40L }
+            if (now - lastGlass < gap) return
+        }
         lastGlass = now
         glassViews.forEach { it.v.invalidate() }
     }
 
     private fun applyGlass() {
-        glassViews.forEach { it.enabled = Store.glass }
+        ambient.glow = Store.ambient
+        ambient.invalidateSelf()
+        GlassSurface.refreshAll()
         styleTabs()
     }
 
@@ -627,37 +732,198 @@ class MainActivity : AppCompatActivity() {
     }
 
     fun settings() {
-        val labels = arrayOf(
-            "Liquid Glass: " + (if (Store.glass) "On" else "Off"),
-            "Playback speed: " + Store.speed + "x",
-            "Pitch follows speed: " + (if (Store.pitchSpeed) "On" else "Off"),
-            "Preload next track: " + (if (Store.prefetch) "On" else "Off"),
-            "Discord status: " + discordLabel(),
-            "Accent color: " + Pal.ACCENT_NAMES[Store.accentIdx.coerceIn(0, Pal.ACCENT_NAMES.size - 1)],
-            "Sleep timer: " + sleepLabel(),
-            "Check for updates (v" + Updater.currentName(this) + ")",
-            "About Ye Tracker",
-            "Lighter Liquid Glass: " + (if (Store.glassLite) "On" else "Off (full quality)"),
-            "Reset Wrapped stats"
-        )
-        MaterialAlertDialogBuilder(this).setTitle("Settings").setItems(labels) { _, i ->
-            when (i) {
-                0 -> { Store.glass = !Store.glass; applyGlass(); settings() }
-                1 -> speedDialog()
-                2 -> { Store.pitchSpeed = !Store.pitchSpeed; applySpeed(); settings() }
-                3 -> { Store.prefetch = !Store.prefetch; settings() }
-                4 -> discordMenu()
-                5 -> accentDialog()
-                6 -> sleepDialog()
-                7 -> checkUpdate(true)
-                8 -> aboutDialog()
-                9 -> { Store.glassLite = !Store.glassLite; invalidateGlass(true); settings() }
-                else -> MaterialAlertDialogBuilder(this).setTitle("Reset Wrapped?")
-                    .setMessage("This clears your listening minutes, play counts and top songs.")
-                    .setPositiveButton("Reset") { _, _ -> Store.resetStats(); toast("Wrapped reset"); settings() }
-                    .setNegativeButton("Cancel") { _, _ -> settings() }.show()
+        val labels = ArrayList<String>()
+        val actions = ArrayList<() -> Unit>()
+        fun row(l: String, a: () -> Unit) { labels.add(l); actions.add(a) }
+        fun onOff(v: Boolean): String = if (v) "On" else "Off"
+        row("Liquid Glass: " + GLASS_NAMES[Store.glassMode.coerceIn(0, 3)]) { glassModeDialog() }
+        row("Glass cards & buttons: " + onOff(Store.glassAll)) { Store.glassAll = !Store.glassAll; applyGlass(); settings() }
+        row("Glass update while scrolling: " + REFRESH_NAMES[Store.glassRefresh.coerceIn(0, 2)]) { glassRefreshDialog() }
+        row("Ambient glow: " + onOff(Store.ambient)) { Store.ambient = !Store.ambient; applyGlass(); settings() }
+        row("Animations: " + onOff(Store.animations)) { Store.animations = !Store.animations; settings() }
+        row("Cover art: " + COVER_NAMES[Store.covers.coerceIn(0, 2)]) { coversDialog() }
+        row("Playback speed: " + Store.speed + "x") { speedDialog() }
+        row("Pitch follows speed: " + onOff(Store.pitchSpeed)) { Store.pitchSpeed = !Store.pitchSpeed; applySpeed(); settings() }
+        row("Equalizer: " + EQ_NAMES[Store.eqPreset.coerceIn(0, EQ_NAMES.size - 1)]) { eqDialog() }
+        row("Skip silence: " + onOff(Store.skipSilence)) {
+            Store.skipSilence = !Store.skipSilence
+            Bus.skipSilence = Store.skipSilence
+            Bus.applyAudio?.invoke()
+            settings()
+        }
+        row("Preload next track: " + onOff(Store.prefetch)) { Store.prefetch = !Store.prefetch; settings() }
+        row("Sleep timer: " + sleepLabel()) { sleepDialog() }
+        row("Accent color: " + Pal.ACCENT_NAMES[Store.accentIdx.coerceIn(0, Pal.ACCENT_NAMES.size - 1)]) { accentDialog() }
+        row("Pure black background: " + onOff(Store.amoled) + " (next launch)") { Store.amoled = !Store.amoled; settings() }
+        row("Haptic feedback: " + onOff(Store.haptics)) { Store.haptics = !Store.haptics; settings() }
+        row("Discord status: " + discordLabel()) { discordMenu() }
+        row("Downloads: " + formatBytes(Store.downloadsSize())) { storageDialog() }
+        row("Back up my data (share)") { backupData() }
+        row("Restore from clipboard") { restoreData() }
+        row("Check for updates (v" + Updater.currentName(this) + ")") { checkUpdate(true) }
+        row("About Ye Tracker") { aboutDialog() }
+        row("Reset Wrapped stats") {
+            MaterialAlertDialogBuilder(this).setTitle("Reset Wrapped?")
+                .setMessage("This clears your listening minutes, play counts, streak and top songs.")
+                .setPositiveButton("Reset") { _, _ -> Store.resetStats(); toast("Wrapped reset"); settings() }
+                .setNegativeButton("Cancel") { _, _ -> settings() }.showGlass()
+        }
+        MaterialAlertDialogBuilder(this).setTitle("Settings")
+            .setItems(labels.toTypedArray()) { _, i -> actions[i]() }
+            .setNegativeButton("Done", null).showGlass()
+    }
+
+    fun haptic() {
+        if (Store.haptics) window.decorView.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+    }
+
+    private fun glassModeDialog() {
+        MaterialAlertDialogBuilder(this).setTitle("Liquid Glass")
+            .setItems(GLASS_NAMES.toTypedArray()) { _, i ->
+                Store.glassMode = i
+                applyGlass()
+                settings()
+            }.showGlass()
+    }
+
+    private fun glassRefreshDialog() {
+        MaterialAlertDialogBuilder(this).setTitle("Glass update while scrolling")
+            .setItems(REFRESH_NAMES.toTypedArray()) { _, i ->
+                Store.glassRefresh = i
+                invalidateGlass(true)
+                settings()
+            }.showGlass()
+    }
+
+    private fun coversDialog() {
+        MaterialAlertDialogBuilder(this).setTitle("Cover art")
+            .setItems(COVER_NAMES.toTypedArray()) { _, i ->
+                Store.covers = i
+                settings()
+            }.showGlass()
+    }
+
+    private fun eqDialog() {
+        MaterialAlertDialogBuilder(this).setTitle("Equalizer")
+            .setItems(EQ_NAMES.toTypedArray()) { _, i ->
+                Store.eqPreset = i
+                Bus.eqPreset = i
+                Bus.applyAudio?.invoke()
+                settings()
+            }.showGlass()
+    }
+
+    private fun storageDialog() {
+        val n = Store.downloads().size
+        MaterialAlertDialogBuilder(this).setTitle("Downloads")
+            .setMessage(n.toString() + " songs · " + formatBytes(Store.downloadsSize()) +
+                "\n\nSongs are also copied to Music/Ye Tracker. Clearing here only removes the in-app copies.")
+            .setPositiveButton("Clear all downloads") { _, _ ->
+                Store.clearDownloads()
+                refreshAdapters()
+                toast("Downloads cleared")
+                settings()
             }
-        }.setNegativeButton("Done", null).show()
+            .setNegativeButton("Back") { _, _ -> settings() }.showGlass()
+    }
+
+    private fun backupData() {
+        val i = Intent(Intent.ACTION_SEND)
+        i.type = "text/plain"
+        i.putExtra(Intent.EXTRA_SUBJECT, "Ye Tracker backup")
+        i.putExtra(Intent.EXTRA_TEXT, Store.exportJson())
+        startActivity(Intent.createChooser(i, "Save your backup"))
+    }
+
+    private fun restoreData() {
+        val cm = getSystemService(ClipboardManager::class.java)
+        val clip = cm?.primaryClip
+        val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this).toString() else ""
+        if (text.isEmpty()) { toast("Copy your backup text first, then try again"); return }
+        MaterialAlertDialogBuilder(this).setTitle("Restore backup?")
+            .setMessage("This replaces your favorites, playlists and Wrapped stats with the copied backup.")
+            .setPositiveButton("Restore") { _, _ ->
+                if (Store.importJson(text)) {
+                    toast("Backup restored")
+                    selectTab(tab)
+                } else {
+                    toast("That isn't a Ye Tracker backup")
+                }
+            }
+            .setNegativeButton("Cancel", null).showGlass()
+    }
+
+    private fun handleShortcut(i: Intent?) {
+        val a = i?.getStringExtra("action") ?: return
+        i.removeExtra("action")
+        when (a) {
+            "shuffle" -> startShuffle()
+            "search" -> selectTab(3)
+            "downloads" -> { selectTab(2); openDownloads() }
+        }
+    }
+
+    fun startRadio(era: String) {
+        toast("Starting $era radio…")
+        bg {
+            try {
+                val songs = Tracker.random(25, null, era).filter { it.playable }
+                ui {
+                    if (songs.isEmpty()) {
+                        toast("No playable songs found for this era")
+                    } else {
+                        playQueue(songs, 0, "$era Radio", true)
+                        radioEra = era
+                    }
+                }
+            } catch (e: Exception) {
+                ui { toast("Couldn't start radio: " + (e.message ?: "network error")) }
+            }
+        }
+    }
+
+    fun downloadAll(list: List<Song>) {
+        if (list.isEmpty()) { toast("Nothing new to download"); return }
+        MaterialAlertDialogBuilder(this).setTitle("Download " + list.size + " songs?")
+            .setMessage("They download one after another while the app stays open.")
+            .setPositiveButton("Download") { _, _ ->
+                hadDownloads = true
+                bg {
+                    var ok = 0
+                    var fail = 0
+                    for (s in list) {
+                        val err = Downloader.download(applicationContext, s)
+                        if (err == null) ok++ else fail++
+                        ui { refreshAdapters() }
+                    }
+                    ui { toast("Downloaded $ok songs" + (if (fail > 0) ", $fail failed" else "")) }
+                }
+            }
+            .setNegativeButton("Cancel", null).showGlass()
+    }
+
+    fun resumeLast() {
+        val s = Store.lastSong ?: return
+        resumePos = Store.lastPos
+        playQueue(listOf(s), 0, "Continue Listening", false)
+    }
+
+    fun playlistMenu(name: String, then: () -> Unit) {
+        MaterialAlertDialogBuilder(this).setTitle(name).setItems(arrayOf("Rename", "Delete")) { _, i ->
+            if (i == 0) renamePlaylistDialog(name, then) else deletePlaylistDialog(name, then)
+        }.showGlass()
+    }
+
+    private fun renamePlaylistDialog(name: String, then: () -> Unit) {
+        val input = android.widget.EditText(this)
+        input.setText(name)
+        input.setSingleLine(true)
+        input.setSelection(name.length)
+        MaterialAlertDialogBuilder(this).setTitle("Rename playlist").setView(input)
+            .setPositiveButton("Rename") { _, _ ->
+                if (Store.renamePlaylist(name, input.text.toString())) then() else toast("Pick a different name")
+            }
+            .setNegativeButton("Cancel", null).showGlass()
     }
 
     private fun discordLabel(): String = when {
@@ -671,7 +937,7 @@ class MainActivity : AppCompatActivity() {
         if (!Discord.available) {
             MaterialAlertDialogBuilder(this).setTitle("Discord status")
                 .setMessage("This build doesn't include the Discord Social SDK yet. Put discord_partner_sdk.aar in app/libs and rebuild (see README).")
-                .setPositiveButton("OK", null).show()
+                .setPositiveButton("OK", null).showGlass()
             return
         }
         val items = if (Store.discordOn) arrayOf("Turn off", "Unlink Discord account") else arrayOf("Connect Discord")
@@ -683,7 +949,7 @@ class MainActivity : AppCompatActivity() {
             }
             lastPresence = ""
             settings()
-        }.show()
+        }.showGlass()
     }
 
     private fun pushPresence() {
@@ -723,7 +989,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Open GitHub") { _, _ ->
                 startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/" + Updater.REPO)))
             }
-            .setNegativeButton("Close", null).show()
+            .setNegativeButton("Close", null).showGlass()
     }
 
     /** After an update installs, show what changed once. */
@@ -733,8 +999,8 @@ class MainActivity : AppCompatActivity() {
         Store.lastVersion = cur
         if (last.isEmpty() || last == cur) return
         MaterialAlertDialogBuilder(this).setTitle("Updated to v$cur")
-            .setMessage("• About screen in Settings\n• New option: Lighter Liquid Glass (off = full quality, on = easier on the battery)\n• This what's-new note after updating")
-            .setPositiveButton("Nice", null).show()
+            .setMessage("• Everything is Liquid Glass: floating glass header, labelled glass tab bar, glass cards, chips and dialogs\n• Ambient glow that follows the current song\n• Performance toggles in Settings: glass mode, update rate, ambient glow, animations, cover art\n• Song length on every row, progress line on the mini player")
+            .setPositiveButton("Nice", null).showGlass()
     }
 
     /* ----- updater ----- */
@@ -760,7 +1026,7 @@ class MainActivity : AppCompatActivity() {
         MaterialAlertDialogBuilder(this).setTitle("Update available · v" + info.name)
             .setMessage(msg)
             .setPositiveButton("Update") { _, _ -> downloadUpdate(info) }
-            .setNegativeButton("Later", null).show()
+            .setNegativeButton("Later", null).showGlass()
     }
 
     private fun downloadUpdate(info: Updater.Info) {
@@ -770,7 +1036,7 @@ class MainActivity : AppCompatActivity() {
         box.setPadding(dp(24), dp(16), dp(24), dp(8))
         box.addView(bar, LinearLayout.LayoutParams(MATCH_, WRAP_))
         val dlg = MaterialAlertDialogBuilder(this).setTitle("Downloading update…")
-            .setView(box).setCancelable(false).show()
+            .setView(box).setCancelable(false).showGlass()
         bg {
             try {
                 val f = Updater.download(this, info) { p -> ui { bar.progress = p } }
@@ -800,7 +1066,7 @@ class MainActivity : AppCompatActivity() {
                 Store.accentIdx = i
                 toast("Accent color applies next time you open the app")
                 settings()
-            }.show()
+            }.showGlass()
     }
 
     private fun sleepLabel(): String {
@@ -829,7 +1095,7 @@ class MainActivity : AppCompatActivity() {
                 else -> toast("Sleep timer off")
             }
             settings()
-        }.show()
+        }.showGlass()
     }
 
     private fun speedDialog() {
@@ -839,23 +1105,35 @@ class MainActivity : AppCompatActivity() {
                 Store.speed = speeds[i]
                 applySpeed()
                 settings()
-            }.show()
+            }.showGlass()
     }
 
     fun push(v: View) {
-        v.setBackgroundColor(Pal.BG)
+        val bgd = AmbientDrawable()
+        bgd.glow = Store.ambient
+        bgd.setColors(ambient.c1, ambient.c2)
+        v.background = bgd
         content.addView(v, FrameLayout.LayoutParams(MATCH_, MATCH_))
-        v.translationX = root.width.toFloat()
-        v.animate().translationX(0f).setDuration(260).setInterpolator(DecelerateInterpolator()).start()
+        updateHeader()
+        if (Store.animations) {
+            v.translationX = root.width.toFloat()
+            v.animate().translationX(0f).setDuration(260).setInterpolator(DecelerateInterpolator()).start()
+        }
     }
 
     fun pop() {
         if (popping || content.childCount <= 1) return
-        popping = true
         val v = content.getChildAt(content.childCount - 1)
+        if (!Store.animations) {
+            content.removeView(v)
+            updateHeader()
+            return
+        }
+        popping = true
         v.animate().translationX(root.width.toFloat()).setDuration(210).withEndAction {
             content.removeView(v)
             popping = false
+            updateHeader()
         }.start()
     }
 
@@ -866,8 +1144,8 @@ class MainActivity : AppCompatActivity() {
             }.view)
             return
         }
-        val sub = e.years + " · " + e.count + " songs" + if (e.aka.isNotEmpty()) "\n" + e.aka else ""
-        push(SongListPage(this, e.name, sub, e.name) { cancel, emit ->
+        val sub = (if (e.count >= 0) e.years + " · " + e.count + " songs" else "") + if (e.aka.isNotEmpty()) "\n" + e.aka else ""
+        push(SongListPage(this, e.name, sub, e.name, eraRadio = e.name) { cancel, emit ->
             Tracker.crawl(null, e.name, null, cancel, emit)
         }.view)
     }
@@ -894,13 +1172,13 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Create") { _, _ ->
                 val n = input.text.toString().trim()
                 if (n.isNotEmpty() && Store.createPlaylist(n)) then(n) else toast("Pick a different name")
-            }.setNegativeButton("Cancel", null).show()
+            }.setNegativeButton("Cancel", null).showGlass()
     }
 
     fun deletePlaylistDialog(name: String, then: () -> Unit) {
         MaterialAlertDialogBuilder(this).setTitle("Delete \"$name\"?")
             .setPositiveButton("Delete") { _, _ -> Store.deletePlaylist(name); then() }
-            .setNegativeButton("Cancel", null).show()
+            .setNegativeButton("Cancel", null).showGlass()
     }
 
     private fun addToPlaylistDialog(s: Song) {
@@ -913,7 +1191,7 @@ class MainActivity : AppCompatActivity() {
             } else {
                 newPlaylist { n -> Store.addToPlaylist(n, s); toast("Added to $n") }
             }
-        }.show()
+        }.showGlass()
     }
 
     /* ----- dialogs ----- */
@@ -931,7 +1209,7 @@ class MainActivity : AppCompatActivity() {
         add("Length", s.length); add("Leaked", s.leaked); add("Recorded", s.recorded); add("Credits", s.credits)
         if (s.notes.isNotEmpty()) sb.append("\n").append(s.notes)
         MaterialAlertDialogBuilder(this).setTitle(s.name).setMessage(sb.toString().trim())
-            .setPositiveButton("Close", null).show()
+            .setPositiveButton("Close", null).showGlass()
     }
 
     fun songMenu(s: Song, playlist: String? = null, onChanged: () -> Unit = {}) {
@@ -948,6 +1226,16 @@ class MainActivity : AppCompatActivity() {
         item("Add to playlist…") { addToPlaylistDialog(s) }
         if (playlist != null) item("Remove from this playlist") { Store.removeFromPlaylist(playlist, s.key); onChanged() }
         item("Details & notes") { details(s) }
+        if (s.era.isNotEmpty() && s.era != "Downloads") {
+            item("Go to era") { openEra(Era(-1, s.era, "", "", -1), s.key.startsWith("released:")) }
+        }
+        if (s.artist.isNotEmpty()) {
+            item("More by " + s.artist) {
+                push(SongListPage(this, s.artist, "Released songs", s.era) { cancel, emit ->
+                    Tracker.crawl("released", null, s.artist, cancel, emit)
+                }.view)
+            }
+        }
         item("Share") { shareSong(s) }
         if (dl) item("Delete download") { Store.deleteDownload(s.key); toast("Deleted"); onChanged() }
         else if (!s.key.startsWith("local:")) item("Download") { download(s) }
@@ -955,7 +1243,7 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(siteUrl(s))))
         }
         MaterialAlertDialogBuilder(this).setTitle(s.name)
-            .setItems(labels.toTypedArray()) { _, i -> actions[i]() }.show()
+            .setItems(labels.toTypedArray()) { _, i -> actions[i]() }.showGlass()
     }
 
     private fun siteUrl(s: Song): String =
@@ -1036,7 +1324,14 @@ class MainActivity : AppCompatActivity() {
             .setItems(upcoming.map { it.name }.toTypedArray()) { _, i ->
                 qi += i + 1
                 playCurrent()
-            }.show()
+            }
+            .setNeutralButton("Save as playlist") { _, _ ->
+                val snapshot = queue.toList()
+                newPlaylist { n ->
+                    snapshot.forEach { Store.addToPlaylist(n, it) }
+                    toast("Saved " + snapshot.size + " songs to " + n)
+                }
+            }.showGlass()
     }
 
     /* ----- player open/close ----- */
@@ -1045,12 +1340,20 @@ class MainActivity : AppCompatActivity() {
         if (current == null) return
         playerOpen = true
         player.view.visibility = View.VISIBLE
-        player.view.translationY = root.height.toFloat()
-        player.view.animate().translationY(0f).setDuration(280).start()
+        if (Store.animations) {
+            player.view.translationY = root.height.toFloat()
+            player.view.animate().translationY(0f).setDuration(280).start()
+        } else {
+            player.view.translationY = 0f
+        }
     }
 
     fun closePlayer() {
         playerOpen = false
+        if (!Store.animations) {
+            player.view.visibility = View.GONE
+            return
+        }
         player.view.animate().translationY(root.height.toFloat()).setDuration(240)
             .withEndAction { player.view.visibility = View.GONE }.start()
     }
@@ -1106,6 +1409,7 @@ class MainActivity : AppCompatActivity() {
         queue = list
         qi = index.coerceIn(0, list.size - 1)
         source = src
+        if (!endlessMode) radioEra = null
         endless = endlessMode
         playCurrent()
     }
@@ -1189,6 +1493,10 @@ class MainActivity : AppCompatActivity() {
             c.setMediaItem(MediaItem.Builder().setUri(uri).setMediaMetadata(md).build())
             c.prepare()
             applySpeed()
+            if (resumePos > 0L) {
+                c.seekTo(resumePos)
+                resumePos = 0L
+            }
             c.play()
             loading = false
             updatePlayUi()
@@ -1224,7 +1532,7 @@ class MainActivity : AppCompatActivity() {
         extending = true
         bg {
             try {
-                val more = Tracker.random(20).filter { it.playable }
+                val more = Tracker.random(20, null, radioEra).filter { it.playable }
                 ui {
                     if (more.isNotEmpty() && endless) {
                         val wasAtEnd = qi >= queue.size - 1
@@ -1241,6 +1549,7 @@ class MainActivity : AppCompatActivity() {
 
     fun togglePlay() {
         val c = controller ?: return
+        haptic()
         if (c.isPlaying) c.pause() else c.play()
     }
 
@@ -1255,6 +1564,7 @@ class MainActivity : AppCompatActivity() {
         mini.visibility = if (s == null) View.GONE else View.VISIBLE
         if (s != null) {
             miniTitle.text = s.name
+            ambient.setColors(seedColors(s.era).first, Pal.ACCENT)
             miniSub.text = if (loading) "Loading…" else s.subtitle
             miniArt.background = art(s.era, 9f)
             miniArt.loadCover(s.era, 9f)
@@ -1275,6 +1585,8 @@ class MainActivity : AppCompatActivity() {
             if (c != null) {
                 if (c.isPlaying) {
                     Store.addMs(500)
+                    lastTick++
+                    if (lastTick % 10 == 0) Store.setLast(current, c.currentPosition)
                     val cs = current
                     if (cs != null) {
                         Store.addSongMs(cs, 500)
@@ -1287,8 +1599,14 @@ class MainActivity : AppCompatActivity() {
                 }
                 val d = c.duration
                 player.progress(c.currentPosition, if (d > 0) d else -1L)
+                mini.progress = if (d > 0) c.currentPosition.toFloat() / d else -1f
+                if (mini.visibility == View.VISIBLE) mini.invalidate()
             }
-            invalidateGlass()
+            if (Store.glassRefresh == 2) {
+                if (SystemClock.uptimeMillis() - lastScrollAt > 400) invalidateGlass(true)
+            } else {
+                invalidateGlass()
+            }
             if (Downloader.progress.isNotEmpty()) { hadDownloads = true; refreshAdapters() }
             else if (hadDownloads) { hadDownloads = false; refreshAdapters() }
             main.postDelayed(this, 500)

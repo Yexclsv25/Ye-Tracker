@@ -1,5 +1,6 @@
 package cc.yetracker.mobile
 
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.text.InputType
@@ -21,6 +22,17 @@ import androidx.core.widget.doAfterTextChanged
 private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
+fun lengthSecs(l: String): Int {
+    val parts = l.split(":")
+    return try {
+        when (parts.size) {
+            2 -> parts[0].trim().toInt() * 60 + parts[1].trim().toInt()
+            3 -> parts[0].trim().toInt() * 3600 + parts[1].trim().toInt() * 60 + parts[2].trim().toInt()
+            else -> 0
+        }
+    } catch (_: Exception) { 0 }
+}
+
 fun orderOf(key: String): Long {
     Regex("""^released:(\d+)$""").find(key)?.let { return 10_000_000_000L + it.groupValues[1].toLong() }
     val m = Regex("""^e(\d+):(\d+)$""").find(key) ?: return Long.MAX_VALUE
@@ -34,6 +46,7 @@ class RowHolder(val app: MainActivity) {
     private val art = ImageView(app)
     private val title = app.tv("", 16f, Pal.TEXT, false, 1)
     private val sub = app.tv("", 13f, Pal.SUB, false, 1)
+    private val dur = app.tv("", 13f, Pal.SUB)
     private val more = app.icon(R.drawable.ic_more, Pal.SUB, 8)
 
     init {
@@ -50,6 +63,7 @@ class RowHolder(val app: MainActivity) {
         col.addView(title)
         col.addView(sub)
         root.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = app.dp(14) })
+        root.addView(dur, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginStart = app.dp(6) })
         root.addView(more, LinearLayout.LayoutParams(app.dp(44), app.dp(44)))
     }
 
@@ -62,6 +76,7 @@ class RowHolder(val app: MainActivity) {
             if (has) art.setImageDrawable(null) else art.setImageResource(R.drawable.ic_note)
         }
         title.text = s.name
+        dur.text = s.length
         val playingNow = app.current?.key == s.key
         title.setTextColor(if (playingNow) Pal.ACCENT else Pal.TEXT)
         val base = if (showEra && s.era.isNotEmpty()) s.era + (if (s.tag.isNotEmpty()) " · " + s.tag else "") else s.meta.ifEmpty { s.credits }
@@ -114,14 +129,14 @@ fun styleList(lv: ListView, app: MainActivity) {
     lv.clipToPadding = false
     lv.setPadding(0, 0, 0, app.dp(230))
     lv.overScrollMode = View.OVER_SCROLL_NEVER
-    lv.setBackgroundColor(Pal.BG)
+    lv.setBackgroundColor(Color.TRANSPARENT)
 }
 
 fun pillButton(app: MainActivity, label: String, iconRes: Int, filled: Boolean, onClick: () -> Unit): LinearLayout {
     val b = LinearLayout(app)
     b.orientation = LinearLayout.HORIZONTAL
     b.gravity = Gravity.CENTER
-    b.background = app.rounded(if (filled) Pal.ACCENT else Pal.SURFACE, 14f)
+    b.background = (if (filled) app.glass(14f, Pal.ACCENT) else app.glass(14f))
     val ic = app.icon(iconRes, if (filled) Color.BLACK else Pal.ACCENT)
     b.addView(ic, LinearLayout.LayoutParams(app.dp(20), app.dp(20)))
     val t = app.tv(label, 16f, if (filled) Color.BLACK else Pal.ACCENT, true)
@@ -169,6 +184,7 @@ class SongListPage(
     private val subtitle: String,
     private val seed: String,
     private val playlist: String? = null,
+    private val eraRadio: String? = null,
     private val source: Source
 ) {
     val view = ListView(app)
@@ -177,6 +193,9 @@ class SongListPage(
     private val seen = HashSet<String>()
     private val count = app.tv("Loading…", 13f, Pal.SUB)
     private var dead = false
+    private var playableOnly = false
+    private var sortMode = 0
+    private var statusSuffix = ""
 
     init {
         styleList(view, app)
@@ -192,6 +211,7 @@ class SongListPage(
     }
 
     private fun load() {
+        statusSuffix = " · loading…"
         count.text = "Loading…"
         app.bg {
             try {
@@ -214,13 +234,26 @@ class SongListPage(
     private fun add(batch: List<Song>) {
         for (s in batch) if (seen.add(s.key)) all.add(s)
         all.sortBy { orderOf(it.key) }
-        adapter.items = ArrayList(all)
-        adapter.notifyDataSetChanged()
-        count.text = "${all.size} songs · loading…"
+        rebuild()
     }
 
     private fun finish(error: String?) {
-        count.text = if (error != null) "${all.size} songs · couldn't load everything: $error" else "${all.size} songs"
+        statusSuffix = if (error != null) " · couldn't load everything: $error" else ""
+        rebuild()
+    }
+
+    private fun rebuild() {
+        var l: List<Song> = all
+        if (playableOnly) l = l.filter { it.canPlay }
+        l = when (sortMode) {
+            1 -> l.sortedBy { it.name.lowercase() }
+            2 -> l.sortedByDescending { lengthSecs(it.length) }
+            else -> l
+        }
+        adapter.items = ArrayList(l)
+        adapter.notifyDataSetChanged()
+        val of = if (l.size != all.size) " of " + all.size else ""
+        count.text = l.size.toString() + of + " songs" + statusSuffix
     }
 
     private fun header(): View {
@@ -261,6 +294,35 @@ class SongListPage(
             if (l.isEmpty()) app.toast("Nothing playable yet") else app.playQueue(l, 0, title, false)
         }, LinearLayout.LayoutParams(0, app.dp(48), 1f).apply { marginStart = app.dp(12) })
         col.addView(btns, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = app.dp(18) })
+
+        val chipScroll = HorizontalScrollView(app)
+        chipScroll.isHorizontalScrollBarEnabled = false
+        val chipRow = LinearLayout(app)
+        chipRow.orientation = LinearLayout.HORIZONTAL
+        fun addChip(label: String, onClick: (TextView) -> Unit) {
+            val c = app.tv(label, 14f, Pal.TEXT)
+            c.setPadding(app.dp(16), app.dp(8), app.dp(16), app.dp(8))
+            c.background = app.glass(18f)
+            c.pressable { onClick(c) }
+            chipRow.addView(c, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = app.dp(8) })
+        }
+        addChip("Playable only") { c ->
+            playableOnly = !playableOnly
+            c.background = (if (playableOnly) app.glass(18f, Pal.ACCENT) else app.glass(18f))
+            c.setTextColor(if (playableOnly) Color.BLACK else Pal.TEXT)
+            rebuild()
+        }
+        addChip("Sort: tracker order") { c ->
+            sortMode = (sortMode + 1) % 3
+            c.text = when (sortMode) { 1 -> "Sort: A–Z"; 2 -> "Sort: longest"; else -> "Sort: tracker order" }
+            rebuild()
+        }
+        val radio = eraRadio
+        if (radio != null) addChip("Era radio") { app.startRadio(radio) }
+        addChip("Download all") { app.downloadAll(adapter.items.filter { it.playable && !Store.isDownloaded(it.key) }) }
+        chipScroll.addView(chipRow)
+        col.addView(chipScroll, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = app.dp(12) })
+
         count.gravity = Gravity.START
         col.addView(count, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = app.dp(14) })
         return col
@@ -320,7 +382,7 @@ fun playlistCard(app: MainActivity, name: String, sub: String, isNew: Boolean, o
     col.orientation = LinearLayout.VERTICAL
     val art = FrameLayout(app)
     if (isNew) {
-        art.background = app.rounded(Pal.SURFACE, 12f)
+        art.background = app.glass(12f)
         art.addView(app.icon(R.drawable.ic_add, Pal.ACCENT, 48), FrameLayout.LayoutParams(MATCH, MATCH))
     } else {
         art.background = app.art(name, 12f)
@@ -342,7 +404,7 @@ fun tile(app: MainActivity, iconRes: Int, label: String, trailing: String = "", 
     val t = LinearLayout(app)
     t.orientation = LinearLayout.HORIZONTAL
     t.gravity = Gravity.CENTER_VERTICAL
-    t.background = app.rounded(Pal.SURFACE, 18f)
+    t.background = app.glass(18f)
     t.setPadding(app.dp(12), app.dp(12), app.dp(14), app.dp(12))
     val ic = app.icon(iconRes, Pal.ACCENT, 12)
     ic.background = app.rounded(Pal.ACCENT_DIM, 12f)
@@ -362,6 +424,8 @@ fun tile(app: MainActivity, iconRes: Int, label: String, trailing: String = "", 
 class HomePage(private val app: MainActivity) {
     val view = ScrollView(app)
     private val col = LinearLayout(app)
+    private val contTitle = sectionTitle(app, "Continue Listening")
+    private val contBox = LinearLayout(app)
     private val recentsTitle = sectionTitle(app, "Recents")
     private val recentsBox = LinearLayout(app)
     private val shelves = LinearLayout(app)
@@ -373,16 +437,16 @@ class HomePage(private val app: MainActivity) {
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(0, 0, 0, app.dp(230))
         view.addView(col, ViewGroup.LayoutParams(MATCH, WRAP))
-        col.addView(topBar(app))
-        col.addView(largeTitle(app, "Listen Now"))
+        view.setPadding(0, app.dp(78), 0, 0)
+        view.clipToPadding = false
 
         val card = LinearLayout(app)
         card.orientation = LinearLayout.HORIZONTAL
         card.gravity = Gravity.CENTER_VERTICAL
-        card.background = app.rounded(Pal.SURFACE, 22f)
+        card.background = app.glass(22f)
         card.setPadding(app.dp(14), app.dp(14), app.dp(14), app.dp(14))
         val circ = app.icon(R.drawable.ic_shuffle, Color.BLACK, 16)
-        circ.background = app.rounded(Pal.ACCENT, 33f)
+        circ.background = app.glass(33f, Pal.ACCENT)
         card.addView(circ, LinearLayout.LayoutParams(app.dp(66), app.dp(66)))
         val txt = LinearLayout(app)
         txt.orientation = LinearLayout.VERTICAL
@@ -392,6 +456,9 @@ class HomePage(private val app: MainActivity) {
         card.pressable { app.startShuffle() }
         col.addView(card, LinearLayout.LayoutParams(MATCH, WRAP).apply { setMargins(app.dp(16), app.dp(8), app.dp(16), 0) })
 
+        col.addView(contTitle)
+        contBox.orientation = LinearLayout.VERTICAL
+        col.addView(contBox)
         col.addView(recentsTitle)
         recentsBox.orientation = LinearLayout.VERTICAL
         col.addView(recentsBox)
@@ -403,6 +470,15 @@ class HomePage(private val app: MainActivity) {
     }
 
     fun refresh() {
+        val ls = Store.lastSong
+        contBox.removeAllViews()
+        contTitle.visibility = if (ls == null) View.GONE else View.VISIBLE
+        if (ls != null) {
+            val h = RowHolder(app)
+            h.bind(ls, true) { app.resumeLast() }
+            h.setSub(ls.subtitle + " · resume at " + fmt(Store.lastPos))
+            contBox.addView(h.root)
+        }
         val r = Store.recent().take(4)
         recentsTitle.visibility = if (r.isEmpty()) View.GONE else View.VISIBLE
         recentsBox.removeAllViews()
@@ -423,10 +499,12 @@ class HomePage(private val app: MainActivity) {
                 val best = Tracker.search(null, null, null, null, null, listOf("best"), 20).songs
                 val eras = Tracker.eras()
                 val rel = try { Tracker.random(15, "released") } catch (_: Exception) { emptyList() }
+                val disc = try { Tracker.random(15) } catch (_: Exception) { emptyList() }
                 app.ui {
                     status.visibility = View.GONE
                     app.hideSplash()
                     if (leaks.isNotEmpty()) addSongShelf("Latest Leaks", leaks)
+                    if (disc.isNotEmpty()) addSongShelf("Discover", disc)
                     if (best.isNotEmpty()) addSongShelf("Best Of", best)
                     if (rel.isNotEmpty()) addSongShelf("Released Picks", rel)
                     if (eras.isNotEmpty()) {
@@ -469,7 +547,8 @@ class ErasPage(private val app: MainActivity) {
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(0, app.dp(8), 0, app.dp(230))
         view.addView(col, ViewGroup.LayoutParams(MATCH, WRAP))
-        col.addView(largeTitle(app, "Eras"))
+        view.setPadding(0, app.dp(78), 0, 0)
+        view.clipToPadding = false
 
         val chips = LinearLayout(app)
         chips.orientation = LinearLayout.HORIZONTAL
@@ -495,7 +574,7 @@ class ErasPage(private val app: MainActivity) {
     private fun styleChips() {
         chipViews.forEachIndexed { i, c ->
             val sel = (i == 1) == released
-            c.background = app.rounded(if (sel) Pal.ACCENT else Pal.SURFACE, 20f)
+            c.background = (if (sel) app.glass(20f, Pal.ACCENT) else app.glass(20f))
             c.setTextColor(if (sel) Color.BLACK else Pal.TEXT)
         }
     }
@@ -550,8 +629,8 @@ class LibraryPage(private val app: MainActivity) {
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(0, 0, 0, app.dp(230))
         view.addView(col, ViewGroup.LayoutParams(MATCH, WRAP))
-        col.addView(topBar(app))
-        col.addView(largeTitle(app, "Library"))
+        view.setPadding(0, app.dp(78), 0, 0)
+        view.clipToPadding = false
 
         val wrapped = tile(app, R.drawable.ic_stats, "Your Wrapped", " ") { app.push(WrappedPage(app).view) }
         // replace trailing text: rebuild minutes label inside tile
@@ -613,7 +692,7 @@ class LibraryPage(private val app: MainActivity) {
         cards.add(playlistCard(app, "New playlist", "Saved to this device", true) { app.newPlaylist { refresh() } })
         for (n in Store.playlistNames()) {
             val c = playlistCard(app, n, Store.playlist(n).size.toString() + " songs", false) { app.openPlaylist(n) }
-            c.setOnLongClickListener { app.deletePlaylistDialog(n) { refresh() }; true }
+            c.setOnLongClickListener { app.playlistMenu(n) { refresh() }; true }
             cards.add(c)
         }
         plBox.addView(shelf(app, cards))
@@ -640,13 +719,15 @@ class SearchPage(private val app: MainActivity) {
     private val chipViews = ArrayList<TextView>()
     private var chip = 0
     private var token = 0
+    private val histScroll = HorizontalScrollView(app)
+    private val histRow = LinearLayout(app)
     private val debounce = Runnable { doSearch() }
 
     private val chips = listOf("All", "OG File", "Full", "Lossless", "⭐ Best", "🏆 Grails", "Released")
 
     init {
         view.orientation = LinearLayout.VERTICAL
-        view.addView(largeTitle(app, "Search"))
+        view.setPadding(0, app.dp(78), 0, 0)
 
         input.hint = "Songs, eras, producers"
         input.setHintTextColor(Pal.SUB)
@@ -655,7 +736,7 @@ class SearchPage(private val app: MainActivity) {
         input.inputType = InputType.TYPE_CLASS_TEXT
         input.imeOptions = EditorInfo.IME_ACTION_SEARCH
         input.isSingleLine = true
-        input.background = app.rounded(Pal.SURFACE, 26f)
+        input.background = app.glass(26f)
         input.setPadding(app.dp(20), 0, app.dp(20), 0)
         input.doAfterTextChanged {
             app.main.removeCallbacks(debounce)
@@ -680,6 +761,13 @@ class SearchPage(private val app: MainActivity) {
         view.addView(hs)
         styleChips()
 
+        histScroll.isHorizontalScrollBarEnabled = false
+        histRow.orientation = LinearLayout.HORIZONTAL
+        histRow.setPadding(app.dp(16), app.dp(12), app.dp(8), 0)
+        histScroll.addView(histRow)
+        view.addView(histScroll)
+        renderHistory()
+
         status.setPadding(app.dp(20), app.dp(14), app.dp(20), app.dp(4))
         view.addView(status)
 
@@ -688,16 +776,36 @@ class SearchPage(private val app: MainActivity) {
         view.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f))
     }
 
+    private fun renderHistory() {
+        histRow.removeAllViews()
+        val h = Store.searches()
+        val show = h.isNotEmpty() && chip == 0 && input.text.isNullOrEmpty()
+        histScroll.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        for (q in h) {
+            val c = app.tv(q, 13f, Pal.SUB)
+            c.setPadding(app.dp(14), app.dp(7), app.dp(14), app.dp(7))
+            c.background = app.glass(16f)
+            c.pressable { input.setText(q); input.setSelection(q.length) }
+            histRow.addView(c, LinearLayout.LayoutParams(WRAP, WRAP).apply { marginEnd = app.dp(8) })
+        }
+        val clear = app.tv("Clear", 13f, Pal.ACCENT)
+        clear.setPadding(app.dp(14), app.dp(7), app.dp(14), app.dp(7))
+        clear.pressable { Store.clearSearches(); renderHistory() }
+        histRow.addView(clear)
+    }
+
     private fun styleChips() {
         chipViews.forEachIndexed { i, c ->
             val sel = i == chip
-            c.background = app.rounded(if (sel) Pal.ACCENT else Pal.SURFACE, 18f)
+            c.background = (if (sel) app.glass(18f, Pal.ACCENT) else app.glass(18f))
             c.setTextColor(if (sel) Color.BLACK else Pal.TEXT)
         }
     }
 
     private fun doSearch() {
         val q = input.text.toString().trim()
+        renderHistory()
         val my = ++token
         if (q.isEmpty() && chip == 0) {
             adapter.items = emptyList()
@@ -713,6 +821,7 @@ class SearchPage(private val app: MainActivity) {
                 val qual = if (c == 3) listOf("Lossless") else null
                 val marked = if (c == 4) listOf("best") else if (c == 5) listOf("grail") else null
                 val page = Tracker.search(if (c == 6) "released" else null, q, null, avail, qual, marked, 50)
+                if (q.isNotEmpty() && page.songs.isNotEmpty()) Store.addSearch(q)
                 app.ui {
                     if (my == token) {
                         adapter.items = page.songs
@@ -736,11 +845,28 @@ class WrappedPage(private val app: MainActivity) {
         val c = LinearLayout(app)
         c.orientation = LinearLayout.VERTICAL
         c.gravity = Gravity.CENTER
-        c.background = app.rounded(Pal.SURFACE, 18f)
+        c.background = app.glass(18f)
         c.setPadding(app.dp(8), app.dp(16), app.dp(8), app.dp(16))
         c.addView(app.tv(big, 26f, Pal.ACCENT, true))
         c.addView(app.tv(small, 13f, Pal.SUB))
         return c
+    }
+
+    private fun shareWrapped() {
+        val sb = StringBuilder("My Ye Tracker Wrapped\n")
+        sb.append(Store.ms / 60000).append(" minutes listened · ").append(Store.totalPlays()).append(" plays\n")
+        val top = Store.topSongs(5)
+        if (top.isNotEmpty()) {
+            sb.append("\nTop songs:\n")
+            top.forEachIndexed { n, st ->
+                sb.append(n + 1).append(". ").append(st.song.name).append(" — ").append(st.song.subtitle).append("\n")
+            }
+        }
+        sb.append("\nhttps://github.com/").append(Updater.REPO)
+        val i = Intent(Intent.ACTION_SEND)
+        i.type = "text/plain"
+        i.putExtra(Intent.EXTRA_TEXT, sb.toString())
+        app.startActivity(Intent.createChooser(i, "Share Wrapped"))
     }
 
     init {
@@ -762,6 +888,40 @@ class WrappedPage(private val app: MainActivity) {
         row.addView(statCard(Store.totalPlays().toString(), "plays"), LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = app.dp(10) })
         row.addView(statCard(Store.uniqueSongs().toString(), "songs"), LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = app.dp(10) })
         col.addView(row)
+
+        val row2 = LinearLayout(app)
+        row2.orientation = LinearLayout.HORIZONTAL
+        row2.setPadding(app.dp(16), app.dp(10), app.dp(16), 0)
+        val streak = Store.streak()
+        row2.addView(statCard(streak.toString(), "day streak"), LinearLayout.LayoutParams(0, WRAP, 1f))
+        row2.addView(statCard((Store.todayMs() / 60000).toString(), "min today"), LinearLayout.LayoutParams(0, WRAP, 1f).apply { marginStart = app.dp(10) })
+        col.addView(row2)
+
+        col.addView(sectionTitle(app, "Last 7 days"))
+        val week = Store.last7()
+        val maxMs = (week.maxOfOrNull { it.second } ?: 0L).coerceAtLeast(60000L)
+        val chart = LinearLayout(app)
+        chart.orientation = LinearLayout.HORIZONTAL
+        chart.gravity = Gravity.BOTTOM
+        chart.setPadding(app.dp(20), 0, app.dp(20), 0)
+        val letters = arrayOf("S", "M", "T", "W", "T", "F", "S")
+        for ((day, dayMs) in week) {
+            val colm = LinearLayout(app)
+            colm.orientation = LinearLayout.VERTICAL
+            colm.gravity = Gravity.CENTER_HORIZONTAL or Gravity.BOTTOM
+            val h = maxOf(app.dp(4), (app.dp(90) * (dayMs.toFloat() / maxMs)).toInt())
+            val bar = View(app)
+            bar.background = (if (dayMs > 0) app.glass(6f, Pal.ACCENT) else app.glass(6f))
+            colm.addView(bar, LinearLayout.LayoutParams(app.dp(26), h))
+            colm.addView(app.tv(letters[((day + 4) % 7).toInt()], 12f, Pal.SUB), LinearLayout.LayoutParams(WRAP, WRAP).apply { topMargin = app.dp(4) })
+            chart.addView(colm, LinearLayout.LayoutParams(0, app.dp(120), 1f))
+        }
+        col.addView(chart)
+
+        if (Store.totalPlays() > 0) {
+            col.addView(pillButton(app, "Share my Wrapped", R.drawable.ic_share, true) { shareWrapped() },
+                LinearLayout.LayoutParams(MATCH, app.dp(48)).apply { setMargins(app.dp(16), app.dp(18), app.dp(16), 0) })
+        }
 
         val top = Store.topSongs(25)
         if (top.isEmpty()) {

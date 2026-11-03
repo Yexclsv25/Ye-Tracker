@@ -51,7 +51,7 @@ data class Song(
     val canPlay: Boolean get() = playable || localUri != null
 
     val meta: String
-        get() = (if (isReleased) listOf(artist, length) else listOf(availability, quality, length))
+        get() = (if (isReleased) listOf(artist) else listOf(availability, quality))
             .filter { it.isNotEmpty() }.joinToString(" · ")
 
     /** Second item in search rows, after the era. */
@@ -351,6 +351,13 @@ object Store {
     private val downloads = LinkedHashMap<String, Song>()
     private val stats = LinkedHashMap<String, Stat>()
     private var statsDirty = false
+    private val days = LinkedHashMap<Long, Long>()
+    private var daysDirty = false
+    private val searches = ArrayList<String>()
+    var lastSong: Song? = null
+        private set
+    var lastPos = 0L
+        private set
     var ms = 0L
         private set
     private var lastFlush = 0L
@@ -365,6 +372,16 @@ object Store {
             for (i in 0 until r.length()) recents.add(Song.fromJson(r.getJSONObject(i)))
             val d = JSONArray(sp.getString("downloads", "[]"))
             for (i in 0 until d.length()) Song.fromJson(d.getJSONObject(i)).let { downloads[it.key] = it }
+            val dj = JSONObject(sp.getString("days", "{}"))
+            val dk = dj.keys()
+            while (dk.hasNext()) {
+                val k = dk.next()
+                days[k.toLong()] = dj.optLong(k)
+            }
+            val sj = JSONArray(sp.getString("searches", "[]"))
+            for (i in 0 until sj.length()) searches.add(sj.getString(i))
+            sp.getString("lastSong", null)?.let { lastSong = Song.fromJson(JSONObject(it)) }
+            lastPos = sp.getLong("lastPos", 0L)
             val st = JSONArray(sp.getString("stats", "[]"))
             for (i in 0 until st.length()) {
                 val o = st.getJSONObject(i)
@@ -472,9 +489,11 @@ object Store {
 
     fun resetStats() {
         stats.clear()
+        days.clear()
         ms = 0L
         statsDirty = false
-        sp.edit().putString("stats", "[]").putLong("ms", 0L).apply()
+        daysDirty = false
+        sp.edit().putString("stats", "[]").putString("days", "{}").putLong("ms", 0L).apply()
     }
 
     var lastUpdateCheck: Long
@@ -489,6 +508,43 @@ object Store {
     var glassLite: Boolean
         get() = sp.getBoolean("glassLite", false)
         set(v) { sp.edit().putBoolean("glassLite", v).apply() }
+
+    /** 0 flat, 1 static glass, 2 live (light), 3 live (full). Migrates the old two switches. */
+    var glassMode: Int
+        get() {
+            if (sp.contains("glassMode")) return sp.getInt("glassMode", 3)
+            return if (!sp.getBoolean("glass", true)) 0 else if (sp.getBoolean("glassLite", false)) 2 else 3
+        }
+        set(v) { sp.edit().putInt("glassMode", v).apply() }
+    var glassAll: Boolean
+        get() = sp.getBoolean("glassAll", true)
+        set(v) { sp.edit().putBoolean("glassAll", v).apply() }
+    /** 0 smooth, 1 balanced, 2 only when scrolling stops */
+    var glassRefresh: Int
+        get() = sp.getInt("glassRefresh", 0)
+        set(v) { sp.edit().putInt("glassRefresh", v).apply() }
+    var ambient: Boolean
+        get() = sp.getBoolean("ambient", true)
+        set(v) { sp.edit().putBoolean("ambient", v).apply() }
+    var animations: Boolean
+        get() = sp.getBoolean("animations", true)
+        set(v) { sp.edit().putBoolean("animations", v).apply() }
+    /** 0 always, 1 Wi-Fi only, 2 off */
+    var covers: Int
+        get() = sp.getInt("covers", 0)
+        set(v) { sp.edit().putInt("covers", v).apply() }
+    var amoled: Boolean
+        get() = sp.getBoolean("amoled", false)
+        set(v) { sp.edit().putBoolean("amoled", v).apply() }
+    var haptics: Boolean
+        get() = sp.getBoolean("haptics", true)
+        set(v) { sp.edit().putBoolean("haptics", v).apply() }
+    var eqPreset: Int
+        get() = sp.getInt("eqPreset", 0)
+        set(v) { sp.edit().putInt("eqPreset", v).apply() }
+    var skipSilence: Boolean
+        get() = sp.getBoolean("skipSilence", false)
+        set(v) { sp.edit().putBoolean("skipSilence", v).apply() }
 
     var glass: Boolean
         get() = sp.getBoolean("glass", true)
@@ -532,10 +588,146 @@ object Store {
     fun totalPlays(): Int = stats.values.sumOf { it.plays }
     fun uniqueSongs(): Int = stats.values.count { it.plays > 0 }
 
+    private fun dayIndex(): Long {
+        val t = System.currentTimeMillis()
+        return (t + java.util.TimeZone.getDefault().getOffset(t)) / 86400000L
+    }
+
     fun addMs(d: Long) {
         ms += d
+        val day = dayIndex()
+        days[day] = (days[day] ?: 0L) + d
+        daysDirty = true
         val now = System.currentTimeMillis()
         if (now - lastFlush > 20000) flush()
+    }
+
+    /** Consecutive days (ending today or yesterday) with at least a minute of listening. */
+    fun streak(): Int {
+        var day = dayIndex()
+        if ((days[day] ?: 0L) < 60000L) day--
+        var n = 0
+        while ((days[day] ?: 0L) >= 60000L) { n++; day-- }
+        return n
+    }
+
+    fun todayMs(): Long = days[dayIndex()] ?: 0L
+
+    fun last7(): List<Pair<Long, Long>> {
+        val today = dayIndex()
+        return (6 downTo 0).map { val d = today - it; Pair(d, days[d] ?: 0L) }
+    }
+
+    fun setLast(s: Song?, pos: Long) {
+        lastSong = s?.copy(localUri = null)
+        lastPos = pos
+    }
+
+    /* ----- search history ----- */
+
+    fun searches(): List<String> = searches.toList()
+
+    fun addSearch(q: String) {
+        val t = q.trim()
+        if (t.length < 2) return
+        searches.remove(t)
+        searches.add(0, t)
+        while (searches.size > 8) searches.removeAt(searches.size - 1)
+        sp.edit().putString("searches", JSONArray(searches).toString()).apply()
+    }
+
+    fun clearSearches() {
+        searches.clear()
+        sp.edit().putString("searches", "[]").apply()
+    }
+
+    /* ----- playlists / downloads helpers ----- */
+
+    fun renamePlaylist(old: String, newName: String): Boolean {
+        val n = newName.trim()
+        if (n.isEmpty() || playlists.containsKey(n) || !playlists.containsKey(old)) return false
+        val rebuilt = LinkedHashMap<String, ArrayList<Song>>()
+        for ((k, v) in playlists) rebuilt[if (k == old) n else k] = v
+        playlists.clear()
+        playlists.putAll(rebuilt)
+        savePlaylists()
+        return true
+    }
+
+    fun downloadsSize(): Long = downloads.values.sumOf { s ->
+        val f = fileOf(s)
+        if (f != null && f.exists()) f.length() else 0L
+    }
+
+    fun clearDownloads() {
+        downloads.values.forEach { fileOf(it)?.delete() }
+        downloads.clear()
+        saveList("downloads", downloads.values)
+    }
+
+    /* ----- backup / restore ----- */
+
+    private fun slim(s: Song): JSONObject = s.copy(notes = "").toJson()
+
+    fun exportJson(): String {
+        val o = JSONObject().put("app", "yetracker").put("version", 1).put("ms", ms)
+        val f = JSONArray()
+        favs.values.forEach { f.put(slim(it)) }
+        o.put("favs", f)
+        val p = JSONObject()
+        for ((k, v) in playlists) {
+            val a = JSONArray()
+            v.forEach { a.put(slim(it)) }
+            p.put(k, a)
+        }
+        o.put("playlists", p)
+        val st = JSONArray()
+        stats.values.forEach { st.put(JSONObject().put("song", slim(it.song)).put("plays", it.plays).put("ms", it.ms)) }
+        o.put("stats", st)
+        val dd = JSONObject()
+        for ((k, v) in days) dd.put(k.toString(), v)
+        o.put("days", dd)
+        return o.toString()
+    }
+
+    fun importJson(s: String): Boolean {
+        try {
+            val o = JSONObject(s)
+            if (o.optString("app") != "yetracker") return false
+            favs.clear(); playlists.clear(); stats.clear(); days.clear()
+            ms = o.optLong("ms")
+            val f = o.optJSONArray("favs") ?: JSONArray()
+            for (i in 0 until f.length()) Song.fromJson(f.getJSONObject(i)).let { favs[it.key] = it }
+            val p = o.optJSONObject("playlists") ?: JSONObject()
+            val ks = p.keys()
+            while (ks.hasNext()) {
+                val k = ks.next()
+                val a = p.getJSONArray(k)
+                val l = ArrayList<Song>()
+                for (i in 0 until a.length()) l.add(Song.fromJson(a.getJSONObject(i)))
+                playlists[k] = l
+            }
+            val st = o.optJSONArray("stats") ?: JSONArray()
+            for (i in 0 until st.length()) {
+                val x = st.getJSONObject(i)
+                val song = Song.fromJson(x.getJSONObject("song"))
+                stats[song.key] = Stat(song, x.optInt("plays"), x.optLong("ms"))
+            }
+            val dd = o.optJSONObject("days") ?: JSONObject()
+            val dk = dd.keys()
+            while (dk.hasNext()) {
+                val k = dk.next()
+                days[k.toLong()] = dd.optLong(k)
+            }
+            saveList("favs", favs.values)
+            savePlaylists()
+            statsDirty = true
+            daysDirty = true
+            flush()
+            return true
+        } catch (e: Exception) {
+            return false
+        }
     }
 
     fun flush() {
@@ -546,6 +738,16 @@ object Store {
             val a = JSONArray()
             stats.values.forEach { a.put(JSONObject().put("song", it.song.toJson()).put("plays", it.plays).put("ms", it.ms)) }
             e.putString("stats", a.toString())
+        }
+        if (daysDirty) {
+            daysDirty = false
+            val dj = JSONObject()
+            for ((k, v) in days) dj.put(k.toString(), v)
+            e.putString("days", dj.toString())
+        }
+        lastSong?.let {
+            e.putString("lastSong", it.toJson().toString())
+            e.putLong("lastPos", lastPos)
         }
         e.apply()
     }
